@@ -18,7 +18,14 @@ async def fetch_messages(client, channel, since_time):
     async for message in client.iter_messages(
         channel, reverse=True, offset_date=since_time
     ):
-        messages.append({"date": message.date.isoformat(), "text": message.text})
+        if message.text:
+            messages.append(
+                {
+                    "id": message.id,
+                    "date": message.date.strftime("%d.%m.%y %H:%M:%S"),
+                    "text": message.text,
+                }
+            )
     return messages
 
 
@@ -31,54 +38,102 @@ async def fetch_summary_message(client):
             and ("збито" in message.text.lower())
             and ("➖" in message.text)
         ):
-            return {"date": message.date.isoformat(), "text": message.text}
+            return {
+                "id": message.id,
+                "date": message.date.strftime("%d.%m.%y %H:%M:%S"),
+                "text": message.text,
+            }
     return None
 
 
-async def main(client, all_channels, save_dir="./reports", openai_step=False):
+def process_data(data, save_dir):
+    logger.info("Summarizing data using OpenAI API")
+    client = openai.OpenAI()
+
+    now = datetime.now()
+
+    _prompt = """ Filter and summarize data given to you. \
+        Include only data pertaining to used weaponry, its sightning locations, \
+        its movements at any time and if it was destroyed/disarmed/tracking lost. \
+        Response should contain summary of when \
+        the alarm started/stopped(give time periods if there were more than one), \
+        amount and types of weaponry used in each one and it's trajectories. \
+        Try to give time periods for regions(oblast) if possible, \
+        if not, just specify the general time period of the alarms. \
+        Include the sources(channel names and message date) for the given information. \
+        Give the answer in markdown, in Ukrainian language."""
+
+    filtering_prompt = """\
+        Filter out any information that does not relate to the air alerts \
+        or weaponry location/trajectory/type/etc from the given data, \
+        return back the same json file in the same format excluding \
+        the messages you've filtered out."""
+
+    if not os.path.exists(f"{save_dir}/{now.date()}/openai-filtered.json"):
+        # Send data to ChatGPT API for filtering and compiling
+        chatgpt_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format=openai.types.ResponseFormatJSONObject,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a data analyzer.",
+                },
+                {
+                    "role": "user",
+                    "content": filtering_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": f"The data:\n{json.dumps(data)}",
+                },
+            ],
+        )
+        # Extract the response from ChatGPT
+        filtered_result = chatgpt_response.choices[0].message.content
+
+        # Save the ChatGPT response in Markdown format
+        with open(f"{save_dir}/{now.date()}/openai-filtered.json", "w") as f:
+            json.dump(filtered_result, f)
+
+
+async def main(
+    client, all_channels, prompt, save_dir, refresh=False, openai_step=False
+):
     # Time window to fetch messages from
-    now = datetime.now(UTC)
+    now = datetime.now()
     # TODO tune the time window
-    since_time = now - timedelta(hours=12)
+    since_time = now - timedelta(hours=24)
 
-    summary_message = await fetch_summary_message(client)
+    if not os.path.exists(f"{save_dir}/{now.date()}"):
+        os.mkdir(f"{save_dir}/{now.date()}")
 
-    # Fetch messages from additional channels
-    channels_data = {}
-    for channel in all_channels:
-        messages = await fetch_messages(client, channel, since_time)
-        channels_data[channel] = messages
+    # Skip if report for this day already exists and user didn't specify refresh=True
+    if (not os.path.exists(f"{save_dir}/{now.date()}/messages.json")) or refresh:
+        async with client:
+            summary_message = await fetch_summary_message(client)
 
-    # Compile the data
-    data = {"summary": summary_message, "channels": channels_data}
+            # Fetch messages from additional channels
+            channels_data = {}
+            for channel in all_channels:
+                messages = await fetch_messages(client, channel, since_time)
+                channels_data[channel] = messages
 
-    # Write the collected data to a JSON file
-    with open(f"{save_dir}/messages-{now.date()}.json", "w", encoding="utf8") as f:
-        print(f"Summary:\n{summary_message['text']}")
-        json.dump(data, f, indent=4, ensure_ascii=False)
+            # Compile the data
+            data = {"summary": summary_message, "channels": channels_data}
+
+            # Write the collected data to a JSON file
+            with open(
+                f"{save_dir}/{now.date()}/messages.json", "w", encoding="utf8"
+            ) as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+    else:
+        with open(f"{save_dir}/{now.date()}/messages.json", "r", encoding="utf8") as f:
+            data = json.load(f)
 
     # Skip openai step if not True
-    if not openai_step:
-        return
-
-    # Send data to ChatGPT API for filtering and compiling
-    chatgpt_response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {
-                "role": "user",
-                "content": f"{args.prompt}\n\n{json.dumps(data, indent=4)}",
-            },
-        ],
-    )
-
-    # Extract the response from ChatGPT
-    compiled_result = chatgpt_response["choices"][0]["message"]["content"]
-
-    # Save the ChatGPT response in Markdown format
-    with open("output.md", "w") as f:
-        f.write(compiled_result)
+    if openai_step:
+        client.loop.run_in_executor(None, process_data, data)
 
 
 def parse_args():
@@ -96,12 +151,13 @@ def parse_args():
         "-d",
         "--save-dir",
         default="./reports",
-        help="Directory where to save the reports"
+        help="Directory where to save the reports",
     )
 
     # Optional CLI argument to include openai processing step
     parser.add_argument(
         "--openai-processing",
+        action=argparse.BooleanOptionalAction,
         default=False,
         help="If True, takes additional step to process collected info through OpenAI API",
     )
@@ -115,13 +171,12 @@ def parse_args():
         help="List of additional channels to fetch messages from",
     )
 
-    # Optional CLI argument for ChatGPT prompt
     parser.add_argument(
-        "-p",
-        "--prompt",
-        type=str,
-        default="Filter and summarize the following data:",
-        help="Prompt to guide ChatGPT in processing the collected data",
+        "-r",
+        "--refresh",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If True, collects the data for today anew and overwrites existing one",
     )
 
     return parser.parse_args()
@@ -146,9 +201,30 @@ if __name__ == "__main__":
     openai.api_key = openai_key
 
     # Combine default channels with any additional ones from --add-channels
-    default_channels = []  # Default additional channels to fetch info from
+    default_channels = [
+        "vanek_nikolaev",
+        "monitor_ukr",
+        "war_monitor",
+        "monitorwarr",
+        "dsns_telegram",
+        "dsns_kyiv_region",
+        "gu_dsns_zp",
+        "dsns_sumy",
+        "dsns_mykolaiv",
+        "dsns_lviv",
+        "dsns_kherson",
+    ]  # Default additional channels to fetch info from
     all_channels = default_channels + args.add_channels
 
     # Start the Telegram client and run the script
-    with TelegramClient("aggrbot", api_id, api_hash) as client:
-        client.loop.run_until_complete(main(client, all_channels, save_dir=args.save_dir, openai_step=args.openai_processing))
+    client = TelegramClient("aggrbot", api_id, api_hash)
+    client.loop.run_until_complete(
+        main(
+            client,
+            all_channels,
+            args.prompt,
+            refresh=args.refresh,
+            save_dir=args.save_dir,
+            openai_step=args.openai_processing,
+        )
+    )
