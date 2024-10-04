@@ -2,3 +2,4 @@
 *.session
 _build/*
 .direnv/*
+reports/*
